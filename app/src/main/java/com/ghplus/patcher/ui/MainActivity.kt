@@ -8,6 +8,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
@@ -30,6 +32,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -37,9 +40,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -83,6 +88,12 @@ class MainActivity : ComponentActivity() {
         var apkLabel by remember { mutableStateOf("No APK selected") }
         var busy by remember { mutableStateOf(false) }
         val logLines = remember { mutableStateListOf<String>() }
+        // Per-feature on/off (all on by default). Drives the exclusive patch set.
+        val features = remember {
+            mutableStateMapOf<String, Boolean>().apply {
+                PatchRunner.FEATURES.keys.forEach { put(it, true) }
+            }
+        }
 
         // --- self-update state ---
         var update by remember { mutableStateOf<Release?>(null) }
@@ -189,15 +200,37 @@ class MainActivity : ComponentActivity() {
                 Text(apkLabel, style = MaterialTheme.typography.bodySmall)
                 Divider()
 
+                Text("Patches", style = MaterialTheme.typography.titleSmall)
+                for (feature in PatchRunner.FEATURES.keys) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            feature,
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Switch(
+                            checked = features[feature] != false,
+                            enabled = !busy,
+                            onCheckedChange = { features[feature] = it },
+                        )
+                    }
+                }
+                Divider()
+
                 Button(
                     enabled = apkUri != null && !busy,
                     onClick = {
+                        val enabled = features.filterValues { it }.keys.toSet()
                         busy = true
                         logLines.add("--- patching ---")
                         lifecycleScope.launch {
                             try {
                                 val out = withContext(Dispatchers.IO) {
-                                    runEngine(apkUri!!) { logLines.add(it) }
+                                    runEngine(apkUri!!, enabled) { logLines.add(it) }
                                 }
                                 logLines.add("Output: ${out.name}")
                                 installApk(out)
@@ -268,13 +301,17 @@ class MainActivity : ComponentActivity() {
     }
 
     /** Copy the chosen APK from the content Uri to cache, then run the patcher. */
-    private fun runEngine(apkUri: Uri, log: (String) -> Unit): File {
+    private fun runEngine(
+        apkUri: Uri,
+        enabledFeatures: Set<String>,
+        log: (String) -> Unit,
+    ): File {
         val src = File(cacheDir, "source.apk")
         contentResolver.openInputStream(apkUri).use { input ->
             requireNotNull(input) { "cannot open chosen APK" }
             src.outputStream().use { input.copyTo(it) }
         }
-        return PatchRunner(this, log).run(src)
+        return PatchRunner(this, log).run(src, enabledFeatures)
     }
 
     /** Launch the system package installer for the patched APK (shared with self-update). */

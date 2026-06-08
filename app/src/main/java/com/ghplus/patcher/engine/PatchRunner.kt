@@ -37,33 +37,52 @@ class PatchRunner(
         const val OPT_PACKAGE_NAME = "com.xiaoji.egggameplus"
         const val OPT_APP_NAME = "GameHub+"
 
-        /** The exact, exclusive patch set (matches the desktop `-e` list). */
-        val SELECTED: List<String> = listOf(
-            "Bypass login",
-            "Disable Firebase Crashlytics",
-            "Mute UI sounds",
-            "PC-accurate vibration",
-            "Vibration settings activity",
-            "PC Vibration Settings label resource",
-            "PC Vibration Settings menu row",
-            "Show PC Game Settings row",
-            "Show Game ID label resource",
-            "Show Game ID menu row",
-            "GOG library card (permanent)",
-            "GOG activities (Phase 1)",
-            "GOG menu row",
-            "File manager access",
-            "Banner Tools drawables",
-            "Banner Tools menu row",
-            "Per-game menu id capture (shared)",
-            "Export/Import PC config label resources",
-            "Export/Import PC config rows",
-            "EmuReady Compatibility label resources",
-            "EmuReady compatibility activity",
-            "EmuReady Compatibility row",
-            "EmuReady tile grade badge",
+        /** Always applied (rebrand so it installs alongside stock + the per-game
+         *  id capture that the menu-row features depend on). Not user-toggleable. */
+        val ALWAYS: List<String> = listOf(
             "Change package name",
             "Change app name",
+            "Per-game menu id capture (shared)",
+        )
+
+        /** User-toggleable features -> the patches each enables. Order = UI order;
+         *  the key is the label shown in the app. "Mute UI sounds" has no patch
+         *  (done as a post-step) — handled via the `mute` flag. */
+        val FEATURES: LinkedHashMap<String, List<String>> = linkedMapOf(
+            "Bypass login" to listOf("Bypass login"),
+            "PC-accurate vibration" to listOf(
+                "PC-accurate vibration",
+                "Vibration settings activity",
+                "PC Vibration Settings label resource",
+                "PC Vibration Settings menu row",
+            ),
+            "GOG integration" to listOf(
+                "GOG library card (permanent)",
+                "GOG activities (Phase 1)",
+                "GOG menu row",
+            ),
+            "File manager access" to listOf("File manager access"),
+            "Disable Firebase Crashlytics" to listOf("Disable Firebase Crashlytics"),
+            "Show Game ID" to listOf(
+                "Show Game ID label resource",
+                "Show Game ID menu row",
+            ),
+            "Show PC Game Settings row" to listOf("Show PC Game Settings row"),
+            "Export/Import PC config" to listOf(
+                "Export/Import PC config label resources",
+                "Export/Import PC config rows",
+            ),
+            "EmuReady compatibility" to listOf(
+                "EmuReady Compatibility label resources",
+                "EmuReady compatibility activity",
+                "EmuReady Compatibility row",
+                "EmuReady tile grade badge",
+            ),
+            "Banner Tools menu/grid" to listOf(
+                "Banner Tools drawables",
+                "Banner Tools menu row",
+            ),
+            "Mute UI sounds" to emptyList(),
         )
 
         // Compose sound assets to silence (see CLAUDE.md). Entry names inside the
@@ -76,16 +95,25 @@ class PatchRunner(
     /**
      * Patches [inputApk] and returns the signed output APK in [ctx].cacheDir.
      */
-    fun run(inputApk: File): File {
+    fun run(
+        inputApk: File,
+        enabledFeatures: Set<String> = FEATURES.keys.toSet(),
+    ): File {
         val cache = ctx.cacheDir
+        val mute = "Mute UI sounds" in enabledFeatures
         val tmp = File(cache, "tmp").also { it.deleteRecursively(); it.mkdirs() }
         val framework = File(cache, "framework").also { it.mkdirs() }
 
         // 1. Copy the bundled .rvp to cache (loadPatches reads a real File).
+        //    CRITICAL: Android 14+ refuses to load dex from an app-WRITABLE file
+        //    ("Writable dex file ... is not allowed"), so mark it read-only before
+        //    loadPatches — exactly as ReVanced Manager's Source.outputStream() does.
         val bundleFile = File(cache, "patches.rvp")
+        if (bundleFile.exists()) bundleFile.setWritable(true, true)
         ctx.assets.open("patches.rvp").use { input ->
             bundleFile.outputStream().use { input.copyTo(it) }
         }
+        bundleFile.setReadOnly()
         log("Loaded patch bundle")
 
         // 2. Resolve aapt2 (extracted native lib).
@@ -103,14 +131,18 @@ class PatchRunner(
         )
         log("Bundle exposes ${allPatches.size} patches")
 
-        // 4. Select EXACTLY the named patches (exclusive) and set their options.
+        // 4. Resolve the selected patch names from ALWAYS + the enabled features,
+        //    then map to Patch objects (exclusive: only these run). Names missing
+        //    from the bundle are skipped with a warning rather than failing.
         val byName = allPatches.filter { it.name != null }.associateBy { it.name!! }
-        val selected = SELECTED.map { name ->
-            byName[name] ?: throw IllegalArgumentException("Patch not found in bundle: \"$name\"")
+        val names = LinkedHashSet(ALWAYS)
+        enabledFeatures.forEach { f -> FEATURES[f]?.let { names.addAll(it) } }
+        val selected = names.mapNotNull { name ->
+            byName[name] ?: run { log("(skip: \"$name\" not in bundle)"); null }
         }
         byName["Change package name"]?.options?.set("packageName", OPT_PACKAGE_NAME)
         byName["Change app name"]?.options?.set("appName", OPT_APP_NAME)
-        log("Selected ${selected.size} patches (exclusive)")
+        log("Selected ${selected.size} patches (${enabledFeatures.size} features)")
 
         // 5. Build the patcher (decodes manifest/resources). Mirrors Session.run's
         //    patcher(apkFile, temporaryFilesPath, frameworkFileDirectory, aaptBinaryPath).
@@ -146,18 +178,25 @@ class PatchRunner(
             result.applyTo(unsigned)
         }
 
-        // 8. Mute UI sounds: swap every sound/*.m4a entry for the silent clip.
+        // 8. Mute UI sounds (post-step; toggleable): swap each sound/*.m4a entry
+        //    for the bundled silent clip.
+        val toSign: File
         val muted = File(cache, "GameHubPlus_muted.apk")
-        muteSounds(unsigned, muted)
+        if (mute) {
+            muteSounds(unsigned, muted)
+            toSign = muted
+        } else {
+            toSign = unsigned
+        }
 
         // 9. Sign with the bundled debug keystore (apksig; aligns too).
         log("Signing...")
-        ApkSign(ctx).sign(muted, output, minSdk = 29)
+        ApkSign(ctx).sign(toSign, output, minSdk = 29)
         log("Done: ${output.name}")
 
         tmp.deleteRecursively()
         unsigned.delete()
-        muted.delete()
+        if (mute) muted.delete()
         return output
     }
 

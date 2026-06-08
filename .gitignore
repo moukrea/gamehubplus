@@ -6,6 +6,3 @@ local.properties
 captures/
 .externalNativeBuild/
 .cxx/
-
-# Kotlin incremental cache
-.kotlin/
