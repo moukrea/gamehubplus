@@ -132,6 +132,10 @@ class PatchRunner(
                 "Custom components activity",
                 "Custom components row",
                 "Custom components picker merge",
+                // The gof.a hook (OfflineComponentList) is what actually makes
+                // custom components appear in the in-game picker — without it the
+                // merge writes to a store the picker never reads.
+                "Offline component picker — local list",
             ),
             // Global "GameHub+ mods" hub (GOG + Custom Components). Registers the
             // exported GameHubPlusModsActivity; reachable via the Settings entry
