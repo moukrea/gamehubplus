@@ -56,8 +56,10 @@ class PatchRunner(
                 "PC Vibration Settings label resource",
                 "PC Vibration Settings menu row",
             ),
+            // NOTE: "GOG library card (permanent)" is omitted — it's retired on
+            // 6.0.8 (its fingerprint matches nothing → "Collection is empty").
+            // GOG is reachable via its activities + menu row.
             "GOG integration" to listOf(
-                "GOG library card (permanent)",
                 "GOG activities (Phase 1)",
                 "GOG menu row",
             ),
@@ -158,6 +160,7 @@ class PatchRunner(
         val output = File(cache, "GameHubPlus_patched.apk")
         val unsigned = File(cache, "GameHubPlus_unsigned.apk")
         val selectedSet = selected.toSet()
+        val failed = mutableListOf<String>()
 
         logger.withJavaLogging {
             log("Reading APK and decoding resources...")
@@ -168,16 +171,21 @@ class PatchRunner(
                 frameworkFileDirectory = framework.absolutePath,
             ) { _, _ -> selectedSet }
 
-            // 6. Apply patches; emit per-patch results (mirrors applyPatchesVerbose).
+            // 6. Apply patches. A single patch failing must NOT abort the whole
+            //    build (ReVanced continues + reports), so we log + collect failures
+            //    and keep going; the failed patch's changes are not applied.
             log("Applying patches...")
             val result = patcherFn { patchResult ->
                 val ex = patchResult.exception
                 if (ex != null) {
-                    log("FAILED: ${patchResult.patch.name}: ${ex.message}")
-                    throw ex
+                    log("SKIPPED (failed): ${patchResult.patch.name}: ${ex.message}")
+                    failed.add(patchResult.patch.name ?: "?")
                 } else {
                     log("OK: ${patchResult.patch.name}")
                 }
+            }
+            if (failed.isNotEmpty()) {
+                log("Note: ${failed.size} patch(es) skipped: ${failed.joinToString(", ")}")
             }
 
             // 7. Write patched dex + resources onto a copy of the source APK.

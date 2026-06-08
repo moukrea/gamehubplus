@@ -18,15 +18,19 @@ class PatchLogger(private val sink: (String) -> Unit) {
 
     private val handler = object : Handler() {
         override fun publish(record: LogRecord) {
-            val name = record.loggerName
-            // Mirror Manager: only surface app/library logs, drop noisy framework logs.
             if (record.level.intValue() < Level.INFO.intValue()) return
+            val msg = record.message ?: return
+            // Drop harmless apktool resource-decode noise: the source app's
+            // manifest references app resource ids (0x7f…) that aren't resolvable
+            // during manifest decode; the numeric id is preserved + re-encoded
+            // correctly, so these warnings are cosmetic. (ReVanced emits them too.)
+            if (msg.startsWith("Could not decode attr value")) return
             val prefix = when (record.level) {
                 Level.SEVERE -> "ERROR: "
                 Level.WARNING -> "WARN: "
                 else -> ""
             }
-            sink(prefix + record.message)
+            sink(prefix + msg)
         }
 
         override fun flush() = Unit
