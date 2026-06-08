@@ -1,0 +1,62 @@
+name: build
+
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Build release APK
+        env:
+          # ReVanced patcher/library are published on the ReVanced GitHub
+          # Packages registry, which requires auth. Provide a PAT with
+          # read:packages via the GH_PACKAGES_TOKEN repo secret.
+          GPR_USER: moukrea
+          GPR_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Stage signed APK
+        id: stage
+        run: |
+          VN=$(grep -m1 'versionName' app/build.gradle | grep -oE '"[^"]+"' | tr -d '"')
+          VC=$(grep -m1 'versionCode' app/build.gradle | grep -oE '[0-9]+')
+          APK=$(find app/build/outputs/apk/release -name '*.apk' | head -1)
+          OUT="GameHubPlusPatcher-${VN}-${VC}.apk"
+          cp "$APK" "$OUT"
+          echo "apk=$OUT"        >> "$GITHUB_OUTPUT"
+          echo "vname=$VN"       >> "$GITHUB_OUTPUT"
+          echo "vcode=$VC"       >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GameHubPlusPatcher
+          path: ${{ steps.stage.outputs.apk }}
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            "${{ steps.stage.outputs.apk }}" \
+            --title "GameHub+ Patcher ${{ github.ref_name }}" \
+            --notes "On-device GameHub+ patcher, version ${{ steps.stage.outputs.vname }} (build ${{ steps.stage.outputs.vcode }}). Install over a previous version to update; the app also self-updates from this release." \
+          || gh release upload "${{ github.ref_name }}" \
+            "${{ steps.stage.outputs.apk }}" --clobber

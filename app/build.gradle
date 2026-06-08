@@ -1,0 +1,102 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    // Kotlin 2 Compose compiler plugin.
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
+
+android {
+    namespace 'com.ghplus.patcher'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "com.ghplus.patcher"
+        minSdk 29
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildFeatures {
+        compose true
+        buildConfig true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+        // revanced patcher-android:22.0.2-dev.1 is compiled with a pre-release
+        // Kotlin; allow consuming it (recommended by the compiler error itself).
+        freeCompilerArgs += ['-Xskip-prerelease-check']
+    }
+
+    packaging {
+        jniLibs {
+            // The bundled aapt2 binary must be extracted to disk and executable
+            // at runtime (resolved via applicationInfo.nativeLibraryDir).
+            useLegacyPackaging = true
+        }
+        resources {
+            // ReVanced patcher / dexlib2 / apksig pull in duplicate license + service files.
+            excludes += [
+                'META-INF/LICENSE*',
+                'META-INF/NOTICE*',
+                'META-INF/DEPENDENCIES',
+                'META-INF/*.kotlin_module',
+                'META-INF/versions/**',
+                'META-INF/INDEX.LIST',
+                'META-INF/*.SF',
+                'META-INF/*.DSA',
+                'META-INF/*.RSA',
+                'META-INF/maven/**',
+                'DebugProbesKt.bin',
+            ]
+        }
+    }
+
+    signingConfigs {
+        // Stable, committed community key so the self-update can install over
+        // previous releases (every CI build is signed with the same cert).
+        release {
+            storeFile rootProject.file("keystore/gamehubplus.jks")
+            storePassword "gamehubplus"
+            keyAlias "gamehubplus"
+            keyPassword "gamehubplus"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.activity:activity-compose:1.9.1'
+    implementation platform('androidx.compose:compose-bom:2024.06.00')
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.material3:material3'
+    implementation 'androidx.compose.material:material-icons-extended'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.8.4'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.8.4'
+
+    // --- ReVanced on-device patcher engine ---
+    // patcher-android: the in-process patcher (loadPatches, patcher(), PatchesResult).
+    implementation 'app.revanced:patcher-android:22.0.2-dev.1'
+    // library-android: ApkUtils.applyTo() (merges patched dex + resources.apk).
+    // Exclude the keyless-signing stack (sigstore-java + grpc/protobuf): we sign
+    // with apksig instead, and sigstore-java bundles com.google.api.* classes
+    // that collide with proto-google-common-protos (duplicate class error).
+    implementation('app.revanced:library-android:4.0.0') {
+        exclude group: 'dev.sigstore', module: 'sigstore-java'
+    }
+
+    // apksig: official APK signer (used for the final debug-keystore signing step).
+    implementation 'com.android.tools.build:apksig:8.13.2'
+}

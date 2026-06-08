@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Patched APKs are written to the app's cache dir and shared via FileProvider. -->
+    <cache-path name="patched" path="." />
+    <files-path name="files" path="." />
+</paths>

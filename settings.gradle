@@ -1,0 +1,29 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+    repositories {
+        google()
+        mavenCentral()
+        maven { url "https://jitpack.io" }
+        // ReVanced GitHub Packages registry (patcher-android, library-android).
+        maven {
+            url "https://maven.pkg.github.com/revanced/registry"
+            credentials {
+                // From env (CI sets these from the GH_PACKAGES_TOKEN secret).
+                // getOrElse("") so gradle still configures without a token; the
+                // registry resolution only fails if those deps are actually needed.
+                username = providers.environmentVariable("GPR_USER").getOrElse("")
+                password = providers.environmentVariable("GPR_TOKEN").getOrElse("")
+            }
+        }
+    }
+}
+
+rootProject.name = "GameHubPlusPatcher"
+include ":app"
