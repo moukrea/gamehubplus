@@ -133,6 +133,11 @@ class PatchRunner(
                 "Custom components row",
                 "Custom components picker merge",
             ),
+            // Global "GameHub+ mods" hub (GOG + Custom Components). Registers the
+            // exported GameHubPlusModsActivity; reachable via the Settings entry
+            // (added separately) or `am start -n <pkg>/com.xj.winemu.mods.
+            // GameHubPlusModsActivity`.
+            "GameHub+ mods hub" to listOf("GameHub+ mods activity"),
             "Mute UI sounds" to emptyList(),
             // Post-process mods (no bundle patch; applied to the patched APK in
             // run() and gated on these keys being enabled). See FEAT_* above.
