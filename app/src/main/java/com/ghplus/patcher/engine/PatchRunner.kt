@@ -1,6 +1,7 @@
 package com.ghplus.patcher.engine
 
 import android.content.Context
+import app.revanced.library.ApkUtils
 import app.revanced.library.ApkUtils.applyTo
 import app.revanced.patcher.patch.Patch
 import app.revanced.patcher.patch.loadPatches
@@ -162,10 +163,22 @@ class PatchRunner(
         val selectedSet = selected.toSet()
         val failed = mutableListOf<String>()
 
+        // Mute UI sounds on the SOURCE (toggleable) BEFORE patching, so the
+        // patcher re-encodes a clean, aligned output. Doing it AFTER (re-zipping
+        // the finished apk) re-compresses resources.arsc and breaks alignment,
+        // which Android rejects as "App not installed".
+        val patchInput = if (mute) {
+            val m = File(cache, "GameHubPlus_muted_src.apk")
+            muteSounds(inputApk, m)
+            m
+        } else {
+            inputApk
+        }
+
         logger.withJavaLogging {
             log("Reading APK and decoding resources...")
             val patcherFn = patcher(
-                apkFile = inputApk,
+                apkFile = patchInput,
                 temporaryFilesPath = tmp,
                 aaptBinaryPath = aapt,
                 frameworkFileDirectory = framework.absolutePath,
@@ -188,32 +201,30 @@ class PatchRunner(
                 log("Note: ${failed.size} patch(es) skipped: ${failed.joinToString(", ")}")
             }
 
-            // 7. Write patched dex + resources onto a copy of the source APK.
+            // 7. Write patched dex + resources onto a copy of the (muted) input.
             //    Mirrors Session.run: copy input -> result.applyTo(patched).
             log("Writing patched APK...")
-            inputApk.copyTo(unsigned, overwrite = true)
+            patchInput.copyTo(unsigned, overwrite = true)
             result.applyTo(unsigned)
         }
 
-        // 8. Mute UI sounds (post-step; toggleable): swap each sound/*.m4a entry
-        //    for the bundled silent clip.
-        val toSign: File
-        val muted = File(cache, "GameHubPlus_muted.apk")
-        if (mute) {
-            muteSounds(unsigned, muted)
-            toSign = muted
-        } else {
-            toSign = unsigned
-        }
-
-        // 9. Sign with the bundled debug keystore (apksig; aligns too).
+        // 8. Sign via ReVanced's ApkUtils.signApk — the canonical path that
+        //    zip-aligns, keeps resources.arsc STORED, and writes v2/v3 sigs, i.e.
+        //    an INSTALLABLE apk (raw apksig alone wasn't enough on Android 11+).
         log("Signing...")
-        ApkSign(ctx).sign(toSign, output, minSdk = 29)
+        val keystore = File(cache, "gamehubplus-signing.jks")
+        ctx.assets.open("debug.keystore").use { i ->
+            keystore.outputStream().use { i.copyTo(it) }
+        }
+        ApkUtils.signApk(
+            unsigned, output, "androiddebugkey",
+            ApkUtils.KeyStoreDetails(keystore, "android", "androiddebugkey", "android"),
+        )
         log("Done: ${output.name}")
 
+        if (patchInput != inputApk) patchInput.delete()
         tmp.deleteRecursively()
         unsigned.delete()
-        if (mute) muted.delete()
         return output
     }
 
