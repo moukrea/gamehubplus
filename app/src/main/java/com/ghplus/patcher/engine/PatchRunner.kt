@@ -46,11 +46,21 @@ class PatchRunner(
         private const val KEY_PASSWORD = "gamehubplus"
 
         /** Always applied (rebrand so it installs alongside stock + the per-game
-         *  id capture that the menu-row features depend on). Not user-toggleable. */
+         *  id capture that the menu-row features depend on). Not user-toggleable.
+         *
+         *  "Rewrite custom permissions per variant" namespaces upstream-baked
+         *  custom permissions (e.g. com.xiaoji.egggame.permission.C2D_MESSAGE) to
+         *  the new package. Without it — together with the updateProviders /
+         *  updatePermissions options set on "Change package name" below — the
+         *  patched app keeps com.xiaoji.egggame.* provider authorities and
+         *  permissions, which collide with a stock GameHub install and the
+         *  package installer rejects it as "conflicts with an existing package"
+         *  (INSTALL_FAILED_CONFLICTING_PROVIDER / _DUPLICATE_PERMISSION). */
         val ALWAYS: List<String> = listOf(
             "Change package name",
             "Change app name",
             "Per-game menu id capture (shared)",
+            "Rewrite custom permissions per variant",
         )
 
         /** User-toggleable features -> the patches each enables. Order = UI order;
@@ -159,7 +169,16 @@ class PatchRunner(
         val selected = names.mapNotNull { name ->
             byName[name] ?: run { log("(skip: \"$name\" not in bundle)"); null }
         }
-        byName["Change package name"]?.options?.set("packageName", OPT_PACKAGE_NAME)
+        byName["Change package name"]?.options?.let { opts ->
+            opts["packageName"] = OPT_PACKAGE_NAME
+            // Rewrite provider authorities (7 of them, all com.xiaoji.egggame.*)
+            // and the DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION to the new package
+            // so they don't collide with a stock GameHub install. The app's
+            // libraries build these authorities from packageName at runtime, so
+            // renaming the manifest to match the (now-renamed) package is correct.
+            opts["updateProviders"] = true
+            opts["updatePermissions"] = true
+        }
         byName["Change app name"]?.options?.set("appName", OPT_APP_NAME)
         log("Selected ${selected.size} patches (${enabledFeatures.size} features)")
 
