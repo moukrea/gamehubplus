@@ -8,7 +8,22 @@ import app.revanced.patcher.patch.Patch
 import app.revanced.patcher.patch.loadPatches
 import app.revanced.patcher.patcher
 import com.android.tools.build.apkzlib.zip.ZFile
+import com.android.tools.smali.dexlib2.DexFileFactory
+import com.android.tools.smali.dexlib2.Opcode
+import com.android.tools.smali.dexlib2.Opcodes
+import com.android.tools.smali.dexlib2.builder.BuilderInstruction
+import com.android.tools.smali.dexlib2.builder.MutableMethodImplementation
+import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction11n
+import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction21s
+import com.android.tools.smali.dexlib2.iface.ClassDef
+import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.TwoRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.reference.FieldReference
+import com.android.tools.smali.dexlib2.immutable.ImmutableClassDef
+import com.android.tools.smali.dexlib2.immutable.ImmutableDexFile
+import com.android.tools.smali.dexlib2.immutable.ImmutableMethod
 import java.io.File
+import java.util.Base64
 import java.util.Date
 
 /**
@@ -116,6 +131,21 @@ class PatchRunner(
         // the bundled silent clip.
         private const val SOUND_PREFIX =
             "assets/composeResources/com.xiaoji.egggame.core/files/sound/"
+
+        // Bottom-nav "Profile" label lives in the home module's Compose string
+        // tables (.cvr text: "string|<key>|<base64-utf8>"). We relabel it to
+        // "Settings" per locale — the original GameHub+ rename that the bannerhub
+        // bundle never carried.
+        private const val HOME_CVR_DIR =
+            "assets/composeResources/com.xiaoji.egggame.features.home/"
+        private const val NAV_KEY = "features_home_nav_profile"
+        private val NAV_RENAME: Map<String, String> = linkedMapOf(
+            "values" to "Settings",
+            "values-zh-rCN" to "设置",
+            "values-ja-rJP" to "設定",
+            "values-pt-rBR" to "Configurações",
+            "values-ru-rRU" to "Настройки",
+        )
     }
 
     /**
@@ -234,6 +264,14 @@ class PatchRunner(
             result.applyTo(unsigned)
         }
 
+        // 7b. The two original GameHub+ mods the bannerhub bundle never carried:
+        //     relabel bottom-nav "Profile" -> "Settings", and strip the account /
+        //     login-register / logout block. Done here as post-steps on the
+        //     patched (still unsigned) APK; signing follows and re-aligns.
+        log("Applying GameHub+ UI mods...")
+        renameNavProfile(unsigned)
+        stripAccountSection(unsigned)
+
         // 8. Sign via ReVanced's ApkUtils.signApk — the canonical path that
         //    zip-aligns, keeps resources.arsc STORED, and writes v2/v3 sigs, i.e.
         //    an INSTALLABLE apk (raw apksig alone wasn't enough on Android 11+).
@@ -301,5 +339,111 @@ class PatchRunner(
             }
         }
         log("Muted $replaced UI sound asset(s)")
+    }
+
+    /**
+     * Relabels the bottom-nav "Profile" entry to "Settings" (per locale) by
+     * editing the home module's Compose `.cvr` string tables in [apk]. Each line
+     * is `string|<key>|<base64-utf8>[|...]`; we swap the value for [NAV_KEY].
+     * Ports the original `patch_rename.py` into the on-device flow.
+     */
+    private fun renameNavProfile(apk: File) {
+        var n = 0
+        ZFile.openReadWrite(apk).use { zf ->
+            for ((loc, word) in NAV_RENAME) {
+                val name = "$HOME_CVR_DIR$loc/strings.commonMain.cvr"
+                val entry = zf.get(name) ?: continue
+                val lines = String(entry.read(), Charsets.UTF_8).split("\n")
+                val b64 = Base64.getEncoder().encodeToString(word.toByteArray(Charsets.UTF_8))
+                var found = false
+                val out = lines.map { line ->
+                    val p = line.split("|")
+                    if (!found && p.size >= 3 && p[0] == "string" && p[1] == NAV_KEY) {
+                        found = true
+                        (listOf("string", NAV_KEY, b64) + p.drop(3)).joinToString("|")
+                    } else {
+                        line
+                    }
+                }
+                if (found) {
+                    zf.add(name, out.joinToString("\n").toByteArray(Charsets.UTF_8).inputStream(), true)
+                    n++
+                }
+            }
+        }
+        log("Renamed Profile->Settings in $n nav locale(s)")
+    }
+
+    /**
+     * Removes the account / login-register / logout block from the profile page
+     * by zeroing the gating flag `Lash;->b` in its <init>: inserts a
+     * `const/4 vX, 0` right before the `iput-boolean vX, vY, Lash;->b:Z` store.
+     * Ports the original `patch_login.py` (a smali edit) as a dexlib2 transform
+     * on the patched dex. Scans each classes*.dex for `Lash;` and rewrites only
+     * the one that holds it.
+     */
+    private fun stripAccountSection(apk: File) {
+        val dexNames = ZFile.openReadOnly(apk).use { zf ->
+            zf.entries().map { it.centralDirectoryHeader.name }
+                .filter { it.matches(Regex("classes\\d*\\.dex")) }
+        }
+        for (dexName in dexNames) {
+            val dexBytes = ZFile.openReadOnly(apk).use { it.get(dexName)!!.read() }
+            val tmpIn = File.createTempFile("dexin", ".dex", ctx.cacheDir).apply { writeBytes(dexBytes) }
+            val dex = DexFileFactory.loadDexFile(tmpIn, Opcodes.getDefault())
+            if (dex.classes.none { it.type == "Lash;" }) {
+                tmpIn.delete()
+                continue
+            }
+
+            var patched = false
+            val newClasses: List<ClassDef> = dex.classes.map { cd ->
+                if (cd.type != "Lash;") return@map cd
+                val newDirect = cd.directMethods.map dm@{ m ->
+                    val impl = m.implementation ?: return@dm m
+                    var targetIdx = -1
+                    var reg = -1
+                    impl.instructions.forEachIndexed { i, ins ->
+                        if (targetIdx < 0 && ins.opcode == Opcode.IPUT_BOOLEAN && ins is ReferenceInstruction) {
+                            val r = ins.reference
+                            if (r is FieldReference && r.definingClass == "Lash;" && r.name == "b" && r.type == "Z") {
+                                targetIdx = i
+                                reg = (ins as TwoRegisterInstruction).registerA
+                            }
+                        }
+                    }
+                    if (targetIdx < 0) return@dm m
+                    val mut = MutableMethodImplementation(impl)
+                    val zero: BuilderInstruction = if (reg <= 15) {
+                        BuilderInstruction11n(Opcode.CONST_4, reg, 0)
+                    } else {
+                        BuilderInstruction21s(Opcode.CONST_16, reg, 0)
+                    }
+                    mut.addInstruction(targetIdx, zero)
+                    patched = true
+                    ImmutableMethod(
+                        m.definingClass, m.name, m.parameters, m.returnType,
+                        m.accessFlags, m.annotations, m.hiddenApiRestrictions, mut,
+                    )
+                }
+                ImmutableClassDef(
+                    cd.type, cd.accessFlags, cd.superclass, cd.interfaces, cd.sourceFile,
+                    cd.annotations, cd.staticFields, cd.instanceFields, newDirect, cd.virtualMethods,
+                )
+            }
+            tmpIn.delete()
+            if (!patched) {
+                log("strip: Lash;->b store not found")
+                return
+            }
+            val tmpOut = File.createTempFile("dexout", ".dex", ctx.cacheDir).apply { delete() }
+            DexFileFactory.writeDexFile(tmpOut.absolutePath, ImmutableDexFile(dex.opcodes, newClasses))
+            val outBytes = tmpOut.readBytes()
+            tmpOut.delete()
+            ZFile.openReadWrite(apk).use { it.add(dexName, outBytes.inputStream(), true) }
+            log("Stripped account/login section ($dexName, Lash;->b forced false)")
+            return
+        }
+        log("strip: Lash; not found in any dex")
     }
 }

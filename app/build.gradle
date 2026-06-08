@@ -13,8 +13,8 @@ android {
         applicationId "com.ghplus.patcher"
         minSdk 29
         targetSdk 34
-        versionCode 10
-        versionName "1.9"
+        versionCode 11
+        versionName "1.10"
     }
 
     buildFeatures {
@@ -106,4 +106,8 @@ dependencies {
     // api-scoped guava, which one ZFile.add overload references — lands on the
     // COMPILE classpath (overload resolution needs guava's ByteSource visible).
     implementation 'com.android.tools.build:apkzlib:9.0.1'
+    // smali-dexlib2: read/rewrite the patched dex for the post-patch account-
+    // section strip (insert const/4 before the Lash;->b store). Transitive via
+    // patcher-android; declared explicitly so its API is on the compile classpath.
+    implementation 'com.android.tools.smali:smali-dexlib2:3.0.9'
 }
