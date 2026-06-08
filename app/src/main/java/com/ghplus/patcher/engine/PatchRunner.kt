@@ -7,11 +7,9 @@ import app.revanced.library.ApkUtils.applyTo
 import app.revanced.patcher.patch.Patch
 import app.revanced.patcher.patch.loadPatches
 import app.revanced.patcher.patcher
+import com.android.tools.build.apkzlib.zip.ZFile
 import java.io.File
 import java.util.Date
-import java.util.zip.ZipEntry
-import java.util.zip.ZipFile
-import java.util.zip.ZipOutputStream
 
 /**
  * On-device ReVanced patch runner.
@@ -256,41 +254,31 @@ class PatchRunner(
 
     /**
      * Copies [input] to [output], replacing every compose sound .m4a entry with
-     * the bundled silent clip. Reproduces the desktop post-step that silences UI
-     * sounds at the asset level.
+     * the bundled silent clip.
+     *
+     * CRITICAL: this uses apkzlib's ZFile — the SAME zip writer ReVanced's
+     * ApkUtils.applyTo uses — instead of java.util.zip. java.util.zip's
+     * ZipOutputStream always emits a data descriptor for DEFLATED entries (it
+     * can't seek back to patch the local header), so every entry comes out with
+     * general-purpose bit 3 set. applyTo (ZFile) then copies those entries but
+     * regenerates a central directory with bit 3 CLEAR, producing an
+     * LFH/CD "data descriptor presence mismatch" that apksig rejects at signing
+     * ("Malformed ZIP entry ... LFH: true, CD: false"). ZFile writes AGP-clean,
+     * descriptor-free entries (like the original APK), so the mismatch never
+     * arises. ZFile.close() rewrites the whole archive normalized.
      */
     private fun muteSounds(input: File, output: File) {
         val silent = ctx.assets.open("silent.m4a").use { it.readBytes() }
+        input.copyTo(output, overwrite = true)
         var replaced = 0
-        ZipFile(input).use { zin ->
-            ZipOutputStream(output.outputStream().buffered()).use { zout ->
-                val entries = zin.entries()
-                while (entries.hasMoreElements()) {
-                    val e = entries.nextElement()
-                    val isSound = e.name.startsWith(SOUND_PREFIX) && e.name.endsWith(".m4a")
-                    val outEntry = ZipEntry(e.name).apply {
-                        method = ZipEntry.STORED.let { if (isSound) it else e.method }
-                    }
-                    if (isSound) {
-                        // STORED requires size + crc up front.
-                        val crc = java.util.zip.CRC32().apply { update(silent) }
-                        outEntry.method = ZipEntry.STORED
-                        outEntry.size = silent.size.toLong()
-                        outEntry.compressedSize = silent.size.toLong()
-                        outEntry.crc = crc.value
-                        zout.putNextEntry(outEntry)
-                        zout.write(silent)
-                        zout.closeEntry()
-                        replaced++
-                    } else {
-                        // Preserve original entry verbatim (re-deflate is fine; the
-                        // final apksig step re-aligns the zip anyway).
-                        val plain = ZipEntry(e.name)
-                        zout.putNextEntry(plain)
-                        zin.getInputStream(e).use { it.copyTo(zout) }
-                        zout.closeEntry()
-                    }
-                }
+        ZFile.openReadWrite(output).use { zf ->
+            val names = zf.entries()
+                .map { it.centralDirectoryHeader.name }
+                .filter { it.startsWith(SOUND_PREFIX) && it.endsWith(".m4a") }
+            for (name in names) {
+                // mayCompress = false -> STORED (m4a is already compressed).
+                zf.add(name, silent.inputStream(), false)
+                replaced++
             }
         }
         log("Muted $replaced UI sound asset(s)")

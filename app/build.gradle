@@ -13,8 +13,8 @@ android {
         applicationId "com.ghplus.patcher"
         minSdk 29
         targetSdk 34
-        versionCode 8
-        versionName "1.7"
+        versionCode 9
+        versionName "1.8"
     }
 
     buildFeatures {
@@ -99,4 +99,11 @@ dependencies {
 
     // apksig: official APK signer (used for the final debug-keystore signing step).
     implementation 'com.android.tools.build:apksig:8.13.2'
+    // apkzlib: the AGP zip writer (same one ApkUtils.applyTo uses). We use its
+    // ZFile to rewrite the muted source descriptor-free, matching applyTo's
+    // central-directory style so apksig doesn't reject an LFH/CD mismatch.
+    // Declared explicitly (not just transitively) so its API — and its
+    // api-scoped guava, which one ZFile.add overload references — lands on the
+    // COMPILE classpath (overload resolution needs guava's ByteSource visible).
+    implementation 'com.android.tools.build:apkzlib:9.0.1'
 }
