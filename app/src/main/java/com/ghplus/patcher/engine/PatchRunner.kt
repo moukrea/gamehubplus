@@ -1,12 +1,14 @@
 package com.ghplus.patcher.engine
 
 import android.content.Context
+import app.revanced.library.ApkSigner
 import app.revanced.library.ApkUtils
 import app.revanced.library.ApkUtils.applyTo
 import app.revanced.patcher.patch.Patch
 import app.revanced.patcher.patch.loadPatches
 import app.revanced.patcher.patcher
 import java.io.File
+import java.util.Date
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
@@ -37,6 +39,13 @@ class PatchRunner(
     companion object {
         const val OPT_PACKAGE_NAME = "com.xiaoji.egggameplus"
         const val OPT_APP_NAME = "GameHub+"
+
+        // On-device signing identity. The keystore is generated once with
+        // ReVanced's own ApkSigner (BKS/BouncyCastle, the only format its
+        // ApkUtils.signApk can read) and persisted, so every re-patch reuses the
+        // same cert and GameHub+ updates in place.
+        private const val KEY_ALIAS = "GameHubPlus"
+        private const val KEY_PASSWORD = "gamehubplus"
 
         /** Always applied (rebrand so it installs alongside stock + the per-game
          *  id capture that the menu-row features depend on). Not user-toggleable. */
@@ -212,20 +221,37 @@ class PatchRunner(
         //    zip-aligns, keeps resources.arsc STORED, and writes v2/v3 sigs, i.e.
         //    an INSTALLABLE apk (raw apksig alone wasn't enough on Android 11+).
         log("Signing...")
-        val keystore = File(cache, "gamehubplus-signing.jks")
-        ctx.assets.open("debug.keystore").use { i ->
-            keystore.outputStream().use { i.copyTo(it) }
-        }
-        ApkUtils.signApk(
-            unsigned, output, "androiddebugkey",
-            ApkUtils.KeyStoreDetails(keystore, "android", "androiddebugkey", "android"),
-        )
+        ApkUtils.signApk(unsigned, output, KEY_ALIAS, signingKeyStore())
         log("Done: ${output.name}")
 
         if (patchInput != inputApk) patchInput.delete()
         tmp.deleteRecursively()
         unsigned.delete()
         return output
+    }
+
+    /**
+     * Returns the keystore to sign with, generating it on first use.
+     *
+     * ReVanced's ApkUtils.signApk loads the keystore via
+     * KeyStore.getInstance("BKS", "BC") — a BouncyCastle BKS store. A stock
+     * Android debug.keystore is PKCS12, which that loader rejects with
+     * "Wrong version of key store". So we mint the keystore with the library's
+     * OWN ApkSigner (guaranteed BKS) and persist it in filesDir; reusing it on
+     * every patch keeps a stable signing cert so GameHub+ updates in place.
+     */
+    private fun signingKeyStore(): ApkUtils.KeyStoreDetails {
+        val ksFile = File(ctx.filesDir, "gamehubplus-signing.bks")
+        if (!ksFile.exists()) {
+            log("Generating signing keystore (first run)...")
+            val notAfter = Date(System.currentTimeMillis() + 100L * 365 * 24 * 3600 * 1000)
+            val pair = ApkSigner.newPrivateKeyCertificatePair(KEY_ALIAS, notAfter)
+            val ks = ApkSigner.newKeyStore(
+                setOf(ApkSigner.KeyStoreEntry(KEY_ALIAS, KEY_PASSWORD, pair)),
+            )
+            ksFile.outputStream().use { ks.store(it, KEY_PASSWORD.toCharArray()) }
+        }
+        return ApkUtils.KeyStoreDetails(ksFile, KEY_PASSWORD, KEY_ALIAS, KEY_PASSWORD)
     }
 
     /**
