@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import android.widget.Toast
 import androidx.compose.material.icons.Icons
@@ -46,7 +47,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
 import com.ghplus.patcher.BuildConfig
@@ -235,7 +238,10 @@ class MainActivity : ComponentActivity() {
                                 logLines.add("Output: ${out.name}")
                                 installApk(out)
                             } catch (e: Throwable) {
-                                logLines.add("ERROR: ${e.message}")
+                                // Full detail so it can be copied + reported.
+                                logLines.add("ERROR: ${e.javaClass.simpleName}: ${e.message}")
+                                e.cause?.let { logLines.add("  caused by: ${it.javaClass.simpleName}: ${it.message}") }
+                                e.stackTrace.take(8).forEach { logLines.add("  at $it") }
                             } finally {
                                 busy = false
                             }
@@ -246,10 +252,29 @@ class MainActivity : ComponentActivity() {
                 }
 
                 Spacer(Modifier.height(8.dp))
-                Text("Log", style = MaterialTheme.typography.titleSmall)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Log", style = MaterialTheme.typography.titleSmall)
+                    val clipboard = LocalClipboardManager.current
+                    TextButton(
+                        enabled = logLines.isNotEmpty(),
+                        onClick = {
+                            clipboard.setText(AnnotatedString(logLines.joinToString("\n")))
+                            Toast.makeText(ctx, "Log copied", Toast.LENGTH_SHORT).show()
+                        },
+                    ) { Text("Copy log") }
+                }
                 Divider()
-                for (line in logLines) {
-                    Text(line, style = MaterialTheme.typography.bodySmall)
+                // Selectable so individual lines / the whole error can be copied.
+                SelectionContainer {
+                    Column {
+                        for (line in logLines) {
+                            Text(line, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
                 }
             }
         }

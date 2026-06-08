@@ -110,17 +110,20 @@ class PatchRunner(
         val tmp = File(cache, "tmp").also { it.deleteRecursively(); it.mkdirs() }
         val framework = File(cache, "framework").also { it.mkdirs() }
 
-        // 1. Copy the bundled .rvp to cache (loadPatches reads a real File).
+        // 1. Stage the bundled .rvp in filesDir (stable; cacheDir can be evicted).
         //    CRITICAL: Android 14+ refuses to load dex from an app-WRITABLE file
         //    ("Writable dex file ... is not allowed"), so mark it read-only before
-        //    loadPatches — exactly as ReVanced Manager's Source.outputStream() does.
-        val bundleFile = File(cache, "patches.rvp")
-        if (bundleFile.exists()) bundleFile.setWritable(true, true)
+        //    loadPatches — exactly as ReVanced Manager's Source does.
+        val bundleFile = File(ctx.filesDir, "patches.rvp")
+        // DELETE any prior copy first: a previous run left it read-only, and
+        // re-opening a read-only file for writing throws EACCES. Deleting works
+        // (the file's read-only attr doesn't block deletion in a writable dir).
+        bundleFile.delete()
         ctx.assets.open("patches.rvp").use { input ->
             bundleFile.outputStream().use { input.copyTo(it) }
         }
-        bundleFile.setReadOnly()
-        log("Loaded patch bundle")
+        val ro = bundleFile.setReadOnly()
+        log("Patch bundle staged (read-only=$ro, writable=${bundleFile.canWrite()})")
 
         // 2. Resolve aapt2 (extracted native lib).
         val aapt = Aapt.binary(ctx)
