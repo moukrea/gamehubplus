@@ -82,6 +82,12 @@ class PatchRunner(
                 "Banner Tools drawables",
                 "Banner Tools menu row",
             ),
+            "Custom components (driver/Proton/DXVK)" to listOf(
+                "Custom components label resources",
+                "Custom components activity",
+                "Custom components row",
+                "Custom components picker merge",
+            ),
             "Mute UI sounds" to emptyList(),
         )
 
