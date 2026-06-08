@@ -15,10 +15,13 @@ import com.android.tools.smali.dexlib2.builder.BuilderInstruction
 import com.android.tools.smali.dexlib2.builder.MutableMethodImplementation
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction11n
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction21s
+import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction35c
 import com.android.tools.smali.dexlib2.iface.ClassDef
+import com.android.tools.smali.dexlib2.iface.instruction.FiveRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.TwoRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.reference.FieldReference
+import com.android.tools.smali.dexlib2.iface.reference.TypeReference
 import com.android.tools.smali.dexlib2.immutable.ImmutableClassDef
 import com.android.tools.smali.dexlib2.immutable.ImmutableDexFile
 import com.android.tools.smali.dexlib2.immutable.ImmutableMethod
@@ -264,13 +267,15 @@ class PatchRunner(
             result.applyTo(unsigned)
         }
 
-        // 7b. The two original GameHub+ mods the bannerhub bundle never carried:
-        //     relabel bottom-nav "Profile" -> "Settings", and strip the account /
-        //     login-register / logout block. Done here as post-steps on the
-        //     patched (still unsigned) APK; signing follows and re-aligns.
+        // 7b. The original GameHub+ mods the bannerhub bundle never carried:
+        //     relabel bottom-nav "Profile" -> "Settings", strip the account /
+        //     login-register / logout block, and hide the Play/Home/Leaderboard
+        //     nav tabs (leaving Library + Settings). Post-steps on the patched
+        //     (still unsigned) APK; signing follows and re-aligns.
         log("Applying GameHub+ UI mods...")
         renameNavProfile(unsigned)
         stripAccountSection(unsigned)
+        hideNavTabs(unsigned)
 
         // 8. Sign via ReVanced's ApkUtils.signApk — the canonical path that
         //    zip-aligns, keeps resources.arsc STORED, and writes v2/v3 sigs, i.e.
@@ -445,5 +450,96 @@ class PatchRunner(
             return
         }
         log("strip: Lash; not found in any dex")
+    }
+
+    /**
+     * Hides the Play / Home / Leaderboard bottom-nav tabs (leaving Library +
+     * Settings), by shrinking the two `[Lwy8;` tab arrays the nav builder
+     * `Ldi9;-><init>` fills. The builder constructs a portrait list (1st
+     * `filled-new-array`) and a landscape list (2nd); each tab is one register.
+     * Ports `tabs.py` — verified on 6.0.8 against the route literals:
+     *   portrait  regs {v3=HOME, v5=PLAY, v10=LEADERBOARD, v1=LIBRARY, v6=PROFILE}
+     *   landscape regs {v1=LIBRARY, v3=PLAY, v5=HOME, v6=LEADERBOARD, v4=PROFILE}
+     * We rebuild each filled-new-array with the play/home/leaderboard registers
+     * dropped. A register-set guard aborts (leaving the nav intact) if a future
+     * GameHub changes the array shape, so it can't silently corrupt the nav.
+     */
+    private fun hideNavTabs(apk: File) {
+        // Per-array (portrait, landscape): the full expected register set, and
+        // the registers to drop (play, home, leaderboard).
+        val expect = listOf(setOf(1, 3, 5, 6, 10), setOf(1, 3, 4, 5, 6))
+        val remove = listOf(setOf(5, 3, 10), setOf(3, 5, 6))
+
+        val dexNames = ZFile.openReadOnly(apk).use { zf ->
+            zf.entries().map { it.centralDirectoryHeader.name }
+                .filter { it.matches(Regex("classes\\d*\\.dex")) }
+        }
+        for (dexName in dexNames) {
+            val dexBytes = ZFile.openReadOnly(apk).use { it.get(dexName)!!.read() }
+            val tmpIn = File.createTempFile("dexin", ".dex", ctx.cacheDir).apply { writeBytes(dexBytes) }
+            val dex = DexFileFactory.loadDexFile(tmpIn, Opcodes.getDefault())
+            if (dex.classes.none { it.type == "Ldi9;" }) {
+                tmpIn.delete()
+                continue
+            }
+
+            var changed = false
+            val newClasses: List<ClassDef> = dex.classes.map { cd ->
+                if (cd.type != "Ldi9;") return@map cd
+                val newDirect = cd.directMethods.map dm@{ m ->
+                    val impl = m.implementation ?: return@dm m
+                    val insns = impl.instructions.toList()
+                    val arrIdx = insns.indices.filter { i ->
+                        val ins = insns[i]
+                        ins.opcode == Opcode.FILLED_NEW_ARRAY && ins is ReferenceInstruction &&
+                            (ins.reference as? TypeReference)?.type == "[Lwy8;"
+                    }
+                    if (arrIdx.size != 2) return@dm m
+                    val mut = MutableMethodImplementation(impl)
+                    for (n in 0..1) {
+                        val ins = insns[arrIdx[n]] as FiveRegisterInstruction
+                        val regs = listOf(
+                            ins.registerC, ins.registerD, ins.registerE, ins.registerF, ins.registerG,
+                        ).take(ins.registerCount)
+                        if (regs.toSet() != expect[n]) {
+                            log("hide-tabs: di9 array #$n shape changed; leaving nav intact")
+                            return@dm m
+                        }
+                        val keep = regs.filter { it !in remove[n] }
+                        val ref = (insns[arrIdx[n]] as ReferenceInstruction).reference
+                        mut.replaceInstruction(
+                            arrIdx[n],
+                            BuilderInstruction35c(
+                                Opcode.FILLED_NEW_ARRAY, keep.size,
+                                keep.getOrElse(0) { 0 }, keep.getOrElse(1) { 0 }, keep.getOrElse(2) { 0 },
+                                keep.getOrElse(3) { 0 }, keep.getOrElse(4) { 0 }, ref,
+                            ),
+                        )
+                    }
+                    changed = true
+                    ImmutableMethod(
+                        m.definingClass, m.name, m.parameters, m.returnType,
+                        m.accessFlags, m.annotations, m.hiddenApiRestrictions, mut,
+                    )
+                }
+                if (!changed) cd else ImmutableClassDef(
+                    cd.type, cd.accessFlags, cd.superclass, cd.interfaces, cd.sourceFile,
+                    cd.annotations, cd.staticFields, cd.instanceFields, newDirect, cd.virtualMethods,
+                )
+            }
+            tmpIn.delete()
+            if (!changed) {
+                log("hide-tabs: di9 nav arrays not found")
+                return
+            }
+            val tmpOut = File.createTempFile("dexout", ".dex", ctx.cacheDir).apply { delete() }
+            DexFileFactory.writeDexFile(tmpOut.absolutePath, ImmutableDexFile(dex.opcodes, newClasses))
+            val outBytes = tmpOut.readBytes()
+            tmpOut.delete()
+            ZFile.openReadWrite(apk).use { it.add(dexName, outBytes.inputStream(), true) }
+            log("Hid Play/Home/Leaderboard nav tabs ($dexName)")
+            return
+        }
+        log("hide-tabs: Ldi9; not found in any dex")
     }
 }
