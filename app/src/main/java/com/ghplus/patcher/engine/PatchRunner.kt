@@ -63,6 +63,13 @@ class PatchRunner(
         private const val KEY_ALIAS = "GameHubPlus"
         private const val KEY_PASSWORD = "gamehubplus"
 
+        // Post-process feature labels (mods applied to the patched APK, not bundle
+        // patches). Shared between the FEATURES map and run() so the toggle and the
+        // gate can't drift.
+        const val FEAT_RENAME = "Rename Profile→Settings"
+        const val FEAT_STRIP_ACCOUNT = "Remove account/login section"
+        const val FEAT_HIDE_TABS = "Hide Play/Home/Leaderboard tabs"
+
         /** Always applied (rebrand so it installs alongside stock + the per-game
          *  id capture that the menu-row features depend on). Not user-toggleable.
          *
@@ -127,6 +134,11 @@ class PatchRunner(
                 "Custom components picker merge",
             ),
             "Mute UI sounds" to emptyList(),
+            // Post-process mods (no bundle patch; applied to the patched APK in
+            // run() and gated on these keys being enabled). See FEAT_* above.
+            FEAT_RENAME to emptyList(),
+            FEAT_STRIP_ACCOUNT to emptyList(),
+            FEAT_HIDE_TABS to emptyList(),
         )
 
         // Compose sound assets to silence (see CLAUDE.md). Entry names inside the
@@ -267,15 +279,13 @@ class PatchRunner(
             result.applyTo(unsigned)
         }
 
-        // 7b. The original GameHub+ mods the bannerhub bundle never carried:
-        //     relabel bottom-nav "Profile" -> "Settings", strip the account /
-        //     login-register / logout block, and hide the Play/Home/Leaderboard
-        //     nav tabs (leaving Library + Settings). Post-steps on the patched
-        //     (still unsigned) APK; signing follows and re-aligns.
+        // 7b. The original GameHub+ mods the bannerhub bundle never carried,
+        //     applied as post-steps on the patched (still unsigned) APK and gated
+        //     on their feature toggles. Signing follows and re-aligns.
         log("Applying GameHub+ UI mods...")
-        renameNavProfile(unsigned)
-        stripAccountSection(unsigned)
-        hideNavTabs(unsigned)
+        if (FEAT_RENAME in enabledFeatures) renameNavProfile(unsigned)
+        if (FEAT_STRIP_ACCOUNT in enabledFeatures) stripAccountSection(unsigned)
+        if (FEAT_HIDE_TABS in enabledFeatures) hideNavTabs(unsigned)
 
         // 8. Sign via ReVanced's ApkUtils.signApk — the canonical path that
         //    zip-aligns, keeps resources.arsc STORED, and writes v2/v3 sigs, i.e.
