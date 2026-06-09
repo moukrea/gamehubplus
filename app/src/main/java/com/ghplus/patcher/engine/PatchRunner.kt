@@ -14,6 +14,8 @@ import com.android.tools.smali.dexlib2.Opcodes
 import com.android.tools.smali.dexlib2.builder.BuilderInstruction
 import com.android.tools.smali.dexlib2.builder.MutableMethodImplementation
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction11n
+import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction11x
+import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction21c
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction21s
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction35c
 import com.android.tools.smali.dexlib2.iface.ClassDef
@@ -23,10 +25,14 @@ import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.TwoRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.reference.FieldReference
 import com.android.tools.smali.dexlib2.iface.reference.MethodReference
+import com.android.tools.smali.dexlib2.iface.reference.StringReference
 import com.android.tools.smali.dexlib2.iface.reference.TypeReference
 import com.android.tools.smali.dexlib2.immutable.ImmutableClassDef
 import com.android.tools.smali.dexlib2.immutable.ImmutableDexFile
 import com.android.tools.smali.dexlib2.immutable.ImmutableMethod
+import com.android.tools.smali.dexlib2.immutable.reference.ImmutableFieldReference
+import com.android.tools.smali.dexlib2.immutable.reference.ImmutableMethodReference
+import com.android.tools.smali.dexlib2.immutable.reference.ImmutableStringReference
 import java.io.File
 import java.util.Base64
 import java.util.Date
@@ -71,6 +77,16 @@ class PatchRunner(
         const val FEAT_RENAME = "Rename Profile→Settings"
         const val FEAT_STRIP_ACCOUNT = "Remove account/login section"
         const val FEAT_HIDE_TABS = "Hide Play/Home/Leaderboard tabs"
+        const val FEAT_NO_PRIVACY = "Skip Privacy Policy dialog"
+        const val FEAT_NO_RECS = "Skip \"Customize your home\" screen"
+        const val FEAT_NO_NOTIF = "Skip notification permission"
+
+        // First-launch onboarding gate flags. We PERSIST these true at app startup
+        // (Loxh;->c = putBoolean+apply) so the screens never show AND the consent-
+        // gated init (Firebase etc.) still runs. Faking the read instead crashes.
+        //   app_agreement_agreed                   = Privacy Policy dialog (ao8.e)
+        //   onboarding_custom_recommendation_shown = "Customize your home" (zmn.F)
+        val WRITE_TRUE_KEYS = listOf("app_agreement_agreed", "onboarding_custom_recommendation_shown")
 
         /** Always applied (rebrand so it installs alongside stock + the per-game
          *  id capture that the menu-row features depend on). Not user-toggleable.
@@ -155,6 +171,9 @@ class PatchRunner(
             FEAT_RENAME to emptyList(),
             FEAT_STRIP_ACCOUNT to emptyList(),
             FEAT_HIDE_TABS to emptyList(),
+            FEAT_NO_PRIVACY to emptyList(),
+            FEAT_NO_RECS to emptyList(),
+            FEAT_NO_NOTIF to emptyList(),
         )
 
         // Compose sound assets to silence (see CLAUDE.md). Entry names inside the
@@ -311,6 +330,8 @@ class PatchRunner(
         stripAccountSection(unsigned)
         hideNavTabs(unsigned)
         forceSkipComposables(unsigned)
+        writeAgreementPrefs(unsigned)
+        forceNotifDenied(unsigned)
 
         // 8. Sign via ReVanced's ApkUtils.signApk — the canonical path that
         //    zip-aligns, keeps resources.arsc STORED, and writes v2/v3 sigs, i.e.
@@ -661,5 +682,135 @@ class PatchRunner(
             ZFile.openReadWrite(apk).use { it.add(dexName, outBytes.inputStream(), true) }
         }
         log("Removed profile banner + gear Login/Register + Join banner")
+    }
+
+    /**
+     * Persists the first-launch onboarding gate flags ([WRITE_TRUE_KEYS]) to true
+     * at the start of `AndroidApp.onCreate`, reusing the `Loxh` prefs object the
+     * method already loads to read app_agreement_agreed. Inserting the writes right
+     * before that existing read makes the app run its real "already cleared" path:
+     * the Privacy Policy dialog and the "Customize your home" recs screen never
+     * show, and the consent-gated init (FirebaseApp.initializeApp) still runs — so
+     * the agreed path does not crash (faking the read instead skips that init).
+     */
+    private fun writeAgreementPrefs(apk: File) {
+        val dexNames = ZFile.openReadOnly(apk).use { zf ->
+            zf.entries().map { it.centralDirectoryHeader.name }
+                .filter { it.matches(Regex("classes\\d*\\.dex")) }
+        }
+        for (dexName in dexNames) {
+            val dexBytes = ZFile.openReadOnly(apk).use { it.get(dexName)!!.read() }
+            val tmpIn = File.createTempFile("dexin", ".dex", ctx.cacheDir).apply { writeBytes(dexBytes) }
+            val dex = DexFileFactory.loadDexFile(tmpIn, Opcodes.getDefault())
+            if (dex.classes.none { it.type == "Lcom/xiaoji/egggame/AndroidApp;" }) { tmpIn.delete(); continue }
+            var patched = false
+            val newClasses: List<ClassDef> = dex.classes.map { cd ->
+                if (cd.type != "Lcom/xiaoji/egggame/AndroidApp;") return@map cd
+                val newVirtual = cd.virtualMethods.map vm@{ m ->
+                    val impl = m.implementation ?: return@vm m
+                    if (m.name != "onCreate") return@vm m
+                    val insns = impl.instructions.toList()
+                    val anchor = insns.indexOfFirst { ins ->
+                        (ins.opcode == Opcode.CONST_STRING || ins.opcode == Opcode.CONST_STRING_JUMBO) &&
+                            ins is ReferenceInstruction &&
+                            (ins.reference as? StringReference)?.string == "app_agreement_agreed"
+                    }
+                    if (anchor < 0) return@vm m
+                    val vKey = (insns[anchor] as OneRegisterInstruction).registerA
+                    var vOxh = -1
+                    for (i in anchor - 1 downTo maxOf(0, anchor - 3)) {
+                        if (insns[i].opcode == Opcode.MOVE_RESULT_OBJECT) {
+                            vOxh = (insns[i] as OneRegisterInstruction).registerA; break
+                        }
+                    }
+                    var vBool = -1
+                    for (i in anchor + 1 until minOf(insns.size, anchor + 7)) {
+                        if (insns[i].opcode == Opcode.MOVE_RESULT) {
+                            vBool = (insns[i] as OneRegisterInstruction).registerA; break
+                        }
+                    }
+                    if (vOxh < 0 || vBool < 0 || vOxh > 15 || vKey > 15 || vBool > 15) {
+                        log("writeAgreementPrefs: unsafe registers (oxh=$vOxh key=$vKey bool=$vBool)")
+                        return@vm m
+                    }
+                    val mut = MutableMethodImplementation(impl)
+                    val seq = mutableListOf<BuilderInstruction>()
+                    for (key in WRITE_TRUE_KEYS) {
+                        seq.add(BuilderInstruction21c(Opcode.CONST_STRING, vKey, ImmutableStringReference(key)))
+                        seq.add(BuilderInstruction11n(Opcode.CONST_4, vBool, 1))
+                        seq.add(BuilderInstruction35c(Opcode.INVOKE_VIRTUAL, 3, vOxh, vKey, vBool, 0, 0,
+                            ImmutableMethodReference("Loxh;", "c", listOf("Ljava/lang/String;", "Z"), "V")))
+                    }
+                    for (k in seq.indices.reversed()) mut.addInstruction(anchor, seq[k])
+                    patched = true
+                    ImmutableMethod(
+                        m.definingClass, m.name, m.parameters, m.returnType,
+                        m.accessFlags, m.annotations, m.hiddenApiRestrictions, mut,
+                    )
+                }
+                ImmutableClassDef(
+                    cd.type, cd.accessFlags, cd.superclass, cd.interfaces, cd.sourceFile,
+                    cd.annotations, cd.staticFields, cd.instanceFields, cd.directMethods, newVirtual,
+                )
+            }
+            tmpIn.delete()
+            if (!patched) continue
+            val tmpOut = File.createTempFile("dexout", ".dex", ctx.cacheDir).apply { delete() }
+            DexFileFactory.writeDexFile(tmpOut.absolutePath, ImmutableDexFile(dex.opcodes, newClasses))
+            val outBytes = tmpOut.readBytes(); tmpOut.delete()
+            ZFile.openReadWrite(apk).use { it.add(dexName, outBytes.inputStream(), true) }
+            log("Persisted onboarding gate flags true (AndroidApp.onCreate, $dexName)")
+            return
+        }
+        log("writeAgreementPrefs: AndroidApp not found")
+    }
+
+    /**
+     * Forces `Lrj8;->M(Context)Lpwf;` (the notification-permission decision) to
+     * return `Lpwf;->c` ("Denied") immediately, so the app never asks for the
+     * POST_NOTIFICATIONS runtime permission and treats notifications as off —
+     * replaying the user-declined path the app already handles.
+     */
+    private fun forceNotifDenied(apk: File) {
+        val dexNames = ZFile.openReadOnly(apk).use { zf ->
+            zf.entries().map { it.centralDirectoryHeader.name }
+                .filter { it.matches(Regex("classes\\d*\\.dex")) }
+        }
+        for (dexName in dexNames) {
+            val dexBytes = ZFile.openReadOnly(apk).use { it.get(dexName)!!.read() }
+            val tmpIn = File.createTempFile("dexin", ".dex", ctx.cacheDir).apply { writeBytes(dexBytes) }
+            val dex = DexFileFactory.loadDexFile(tmpIn, Opcodes.getDefault())
+            if (dex.classes.none { it.type == "Lrj8;" }) { tmpIn.delete(); continue }
+            var patched = false
+            val newClasses: List<ClassDef> = dex.classes.map { cd ->
+                if (cd.type != "Lrj8;") return@map cd
+                val newDirect = cd.directMethods.map dm@{ m ->
+                    val impl = m.implementation ?: return@dm m
+                    if (m.name != "M" || m.returnType != "Lpwf;") return@dm m
+                    val mut = MutableMethodImplementation(impl)
+                    mut.addInstruction(0, BuilderInstruction21c(
+                        Opcode.SGET_OBJECT, 0, ImmutableFieldReference("Lpwf;", "c", "Lpwf;")))
+                    mut.addInstruction(1, BuilderInstruction11x(Opcode.RETURN_OBJECT, 0))
+                    patched = true
+                    ImmutableMethod(
+                        m.definingClass, m.name, m.parameters, m.returnType,
+                        m.accessFlags, m.annotations, m.hiddenApiRestrictions, mut,
+                    )
+                }
+                ImmutableClassDef(
+                    cd.type, cd.accessFlags, cd.superclass, cd.interfaces, cd.sourceFile,
+                    cd.annotations, cd.staticFields, cd.instanceFields, newDirect, cd.virtualMethods,
+                )
+            }
+            tmpIn.delete()
+            if (!patched) continue
+            val tmpOut = File.createTempFile("dexout", ".dex", ctx.cacheDir).apply { delete() }
+            DexFileFactory.writeDexFile(tmpOut.absolutePath, ImmutableDexFile(dex.opcodes, newClasses))
+            val outBytes = tmpOut.readBytes(); tmpOut.delete()
+            ZFile.openReadWrite(apk).use { it.add(dexName, outBytes.inputStream(), true) }
+            log("Notification permission: rj8.M -> Denied ($dexName)")
+            return
+        }
+        log("forceNotifDenied: rj8 not found")
     }
 }
