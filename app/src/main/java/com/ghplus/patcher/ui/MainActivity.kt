@@ -33,7 +33,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -91,13 +90,6 @@ class MainActivity : ComponentActivity() {
         var apkLabel by remember { mutableStateOf("No APK selected") }
         var busy by remember { mutableStateOf(false) }
         val logLines = remember { mutableStateListOf<String>() }
-        // Per-feature on/off (all on by default). Drives the exclusive patch set.
-        val features = remember {
-            mutableStateMapOf<String, Boolean>().apply {
-                PatchRunner.FEATURES.keys.forEach { put(it, true) }
-            }
-        }
-
         // --- self-update state ---
         var update by remember { mutableStateOf<Release?>(null) }
         var checking by remember { mutableStateOf(false) }
@@ -203,31 +195,25 @@ class MainActivity : ComponentActivity() {
                 Text(apkLabel, style = MaterialTheme.typography.bodySmall)
                 Divider()
 
-                Text("Patches", style = MaterialTheme.typography.titleSmall)
+                Text("Mods applied", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    "The full GameHub+ mod set is applied as one bundle — no " +
+                        "per-patch toggles (they were error-prone to split).",
+                    style = MaterialTheme.typography.bodySmall,
+                )
                 for (feature in PatchRunner.FEATURES.keys) {
-                    Row(
+                    Text(
+                        "• $feature",
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            feature,
-                            modifier = Modifier.weight(1f),
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                        Switch(
-                            checked = features[feature] != false,
-                            enabled = !busy,
-                            onCheckedChange = { features[feature] = it },
-                        )
-                    }
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                 }
                 Divider()
 
                 Button(
                     enabled = apkUri != null && !busy,
                     onClick = {
-                        val enabled = features.filterValues { it }.keys.toSet()
+                        val enabled = PatchRunner.FEATURES.keys.toSet()
                         busy = true
                         logLines.add("--- patching ---")
                         lifecycleScope.launch {

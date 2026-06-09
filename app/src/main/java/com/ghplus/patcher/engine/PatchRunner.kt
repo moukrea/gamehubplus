@@ -138,10 +138,15 @@ class PatchRunner(
                 "Offline component picker — local list",
             ),
             // Global "GameHub+ mods" hub (GOG + Custom Components). Registers the
-            // exported GameHubPlusModsActivity; reachable via the Settings entry
-            // (added separately) or `am start -n <pkg>/com.xj.winemu.mods.
-            // GameHubPlusModsActivity`.
-            "GameHub+ mods hub" to listOf("GameHub+ mods activity"),
+            // exported GameHubPlusModsActivity AND wires it into the Settings page:
+            // the "entry" patch redirects the Logout confirm (pth crh.a -> nth) to
+            // launch the hub; the "label" patch relabels the row + dialog to
+            // "GameHub+ mods" via an in-place same-length CVR overwrite.
+            "GameHub+ mods hub" to listOf(
+                "GameHub+ mods activity",
+                "Settings GameHub+ mods entry",
+                "Settings GameHub+ mods label",
+            ),
             "Mute UI sounds" to emptyList(),
             // Post-process mods (no bundle patch; applied to the patched APK in
             // run() and gated on these keys being enabled). See FEAT_* above.
@@ -240,7 +245,11 @@ class PatchRunner(
         //    patcher(apkFile, temporaryFilesPath, frameworkFileDirectory, aaptBinaryPath).
         val output = File(cache, "GameHubPlus_patched.apk")
         val unsigned = File(cache, "GameHubPlus_unsigned.apk")
-        val selectedSet = selected.toSet()
+        // Apply ALL patches (no per-patch toggles, per user): the patcher's
+        // compatibility check self-skips the 6.0.4-only ones (GPU Spoof, Legacy
+        // renderer, Mute UI sounds, Disable Firebase Crashlytics). The curated
+        // `selected` set above is now only used to apply the rebrand options.
+        val selectedSet = allPatches
         val failed = mutableListOf<String>()
 
         // Mute UI sounds on the SOURCE (toggleable) BEFORE patching, so the
@@ -291,10 +300,14 @@ class PatchRunner(
         // 7b. The original GameHub+ mods the bannerhub bundle never carried,
         //     applied as post-steps on the patched (still unsigned) APK and gated
         //     on their feature toggles. Signing follows and re-aligns.
+        // Our original GameHub+ mods, always applied (no toggles). The login
+        // strip is the merge-partner of Banner's "Bypass login": bypass makes the
+        // app usable under a synthetic identity, strip removes the now-dead
+        // account/login/logout UI.
         log("Applying GameHub+ UI mods...")
-        if (FEAT_RENAME in enabledFeatures) renameNavProfile(unsigned)
-        if (FEAT_STRIP_ACCOUNT in enabledFeatures) stripAccountSection(unsigned)
-        if (FEAT_HIDE_TABS in enabledFeatures) hideNavTabs(unsigned)
+        renameNavProfile(unsigned)
+        stripAccountSection(unsigned)
+        hideNavTabs(unsigned)
 
         // 8. Sign via ReVanced's ApkUtils.signApk — the canonical path that
         //    zip-aligns, keeps resources.arsc STORED, and writes v2/v3 sigs, i.e.
