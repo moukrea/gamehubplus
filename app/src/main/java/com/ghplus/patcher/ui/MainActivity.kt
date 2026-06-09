@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -23,10 +24,11 @@ import androidx.compose.material.icons.filled.BrightnessAuto
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Divider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -93,7 +95,10 @@ class MainActivity : ComponentActivity() {
         // --- self-update state ---
         var update by remember { mutableStateOf<Release?>(null) }
         var checking by remember { mutableStateOf(false) }
-        var downloading by remember { mutableStateOf(false) }
+        // phase: 0 = prompt, 1 = downloading, 2 = needs "install unknown apps" permission
+        var phase by remember { mutableStateOf(0) }
+        var progress by remember { mutableStateOf(-1f) }
+        var failed by remember { mutableStateOf(false) }
 
         // Re-runnable update check. Toasts "Up to date" only when explicitly invoked.
         fun checkForUpdates(announce: Boolean) {
@@ -102,7 +107,14 @@ class MainActivity : ComponentActivity() {
             lifecycleScope.launch {
                 val latest = UpdateChecker.fetchLatest()
                 checking = false
-                if (latest != null && UpdateChecker.isNewer(latest)) {
+                // An explicit check (announce) ignores a prior "Skip"; the silent
+                // launch check respects it so a skipped version doesn't nag.
+                val skipped = !announce && latest != null &&
+                    UpdateChecker.skippedVersionCode(ctx) == latest.versionCode
+                if (latest != null && UpdateChecker.isNewer(latest) && !skipped) {
+                    phase = 0
+                    progress = -1f
+                    failed = false
                     update = latest
                 } else if (announce) {
                     Toast.makeText(ctx, "Up to date", Toast.LENGTH_SHORT).show()
@@ -123,29 +135,115 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        fun startUpdate(rel: Release) {
+            // First run usually lacks the per-app "install unknown apps" grant;
+            // send the user to the settings screen, then they tap Retry.
+            if (!UpdateChecker.canInstall(ctx)) {
+                phase = 2
+                UpdateChecker.openInstallSettings(ctx)
+                return
+            }
+            phase = 1
+            failed = false
+            progress = -1f
+            lifecycleScope.launch {
+                try {
+                    val apk = UpdateChecker.download(ctx, rel) { progress = it }
+                    UpdateChecker.installApk(ctx, apk)
+                    update = null // the system installer takes over
+                } catch (_: Throwable) {
+                    failed = true
+                    phase = 0
+                }
+            }
+        }
+
         update?.let { rel ->
-            UpdateDialog(
-                release = rel,
-                downloading = downloading,
-                onUpdate = {
-                    downloading = true
-                    lifecycleScope.launch {
-                        try {
-                            val apk = UpdateChecker.download(ctx, rel)
-                            UpdateChecker.installApk(ctx, apk)
-                            update = null
-                        } catch (e: Throwable) {
-                            Toast.makeText(
-                                ctx,
-                                "Update failed: ${e.message}",
-                                Toast.LENGTH_LONG,
-                            ).show()
-                        } finally {
-                            downloading = false
+            AlertDialog(
+                onDismissRequest = { if (phase != 1) update = null },
+                icon = { Icon(Icons.Default.SystemUpdate, contentDescription = null) },
+                title = {
+                    Text(
+                        when (phase) {
+                            1 -> "Updating"
+                            2 -> "Allow installs"
+                            else -> "Update available"
+                        },
+                    )
+                },
+                text = {
+                    Column(
+                        Modifier
+                            .heightIn(max = 340.dp)
+                            .verticalScroll(rememberScrollState()),
+                    ) {
+                        when (phase) {
+                            1 -> {
+                                Text(
+                                    if (progress >= 0f) "Downloading v${rel.versionName} — ${(progress * 100).toInt()}%"
+                                    else "Downloading v${rel.versionName}…",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                                Spacer(Modifier.height(12.dp))
+                                if (progress >= 0f) {
+                                    LinearProgressIndicator(
+                                        progress = progress,
+                                        modifier = Modifier.fillMaxWidth(),
+                                    )
+                                } else {
+                                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                                }
+                            }
+                            2 -> Text(
+                                "To install updates, allow “install unknown apps” for GameHub+ " +
+                                    "Patcher in the settings screen that just opened, then come back " +
+                                    "and tap Retry.",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            else -> {
+                                Text(
+                                    "Version ${rel.versionName} is available " +
+                                        "(you have ${BuildConfig.VERSION_NAME}).",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                                if (failed) {
+                                    Spacer(Modifier.height(8.dp))
+                                    Text(
+                                        "Download failed — check your connection and try again.",
+                                        color = MaterialTheme.colorScheme.error,
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                }
+                                if (rel.notes.isNotBlank()) {
+                                    Spacer(Modifier.height(12.dp))
+                                    Text(
+                                        rel.notes.trim().let { if (it.length > 600) it.take(600) + "…" else it },
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                }
+                            }
                         }
                     }
                 },
-                onDismiss = { if (!downloading) update = null },
+                confirmButton = {
+                    if (phase != 1) {
+                        Button(onClick = { startUpdate(rel) }) {
+                            Text(if (phase == 2) "Retry" else "Update")
+                        }
+                    }
+                },
+                dismissButton = {
+                    when (phase) {
+                        0 -> Row {
+                            TextButton(onClick = {
+                                UpdateChecker.setSkippedVersionCode(ctx, rel.versionCode)
+                                update = null
+                            }) { Text("Skip") }
+                            TextButton(onClick = { update = null }) { Text("Later") }
+                        }
+                        2 -> TextButton(onClick = { update = null }) { Text("Later") }
+                    }
+                },
             )
         }
 
@@ -264,51 +362,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-    }
-
-    @Composable
-    private fun UpdateDialog(
-        release: Release,
-        downloading: Boolean,
-        onUpdate: () -> Unit,
-        onDismiss: () -> Unit,
-    ) {
-        val notes = release.notes.trim().let {
-            if (it.length > 500) it.take(500) + "…" else it
-        }
-        AlertDialog(
-            onDismissRequest = onDismiss,
-            title = {
-                Text("Update available — v${BuildConfig.VERSION_CODE} → v${release.versionCode}")
-            },
-            text = {
-                Column {
-                    Text(
-                        "Version ${release.versionName} (build ${release.versionCode})",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                    if (notes.isNotEmpty()) {
-                        Spacer(Modifier.height(8.dp))
-                        Text(notes, style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-            },
-            confirmButton = {
-                Button(enabled = !downloading, onClick = onUpdate) {
-                    if (downloading) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.height(18.dp),
-                            strokeWidth = 2.dp,
-                        )
-                    } else {
-                        Text("Update")
-                    }
-                }
-            },
-            dismissButton = {
-                TextButton(enabled = !downloading, onClick = onDismiss) { Text("Later") }
-            },
-        )
     }
 
     /** Copy the chosen APK from the content Uri to cache, then run the patcher. */

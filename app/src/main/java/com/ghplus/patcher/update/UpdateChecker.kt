@@ -2,6 +2,8 @@ package com.ghplus.patcher.update
 
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
 import androidx.core.content.FileProvider
 import com.ghplus.patcher.BuildConfig
 import kotlinx.coroutines.Dispatchers
@@ -91,8 +93,41 @@ object UpdateChecker {
     /** True when the release is newer than the installed build. */
     fun isNewer(r: Release): Boolean = r.versionCode > BuildConfig.VERSION_CODE
 
-    /** Download the release APK into cacheDir/updates and return the local file. */
-    suspend fun download(ctx: Context, r: Release): File = withContext(Dispatchers.IO) {
+    // --- install-permission handling (Android 8+ per-app "install unknown apps") ---
+
+    /** True if the app may currently install packages ("install unknown apps" granted). */
+    fun canInstall(ctx: Context): Boolean = ctx.packageManager.canRequestPackageInstalls()
+
+    /** Open the system screen where the user allows this app to install packages. */
+    fun openInstallSettings(ctx: Context) {
+        val intent = Intent(
+            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+            Uri.parse("package:${ctx.packageName}"),
+        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { ctx.startActivity(intent) }
+    }
+
+    // --- "skip this version" so a declined update stops nagging until a newer one ships ---
+
+    private const val PREFS = "update_prefs"
+    private const val KEY_SKIPPED = "skipped_version_code"
+
+    fun skippedVersionCode(ctx: Context): Int =
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(KEY_SKIPPED, -1)
+
+    fun setSkippedVersionCode(ctx: Context, code: Int) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putInt(KEY_SKIPPED, code).apply()
+    }
+
+    /**
+     * Download the release APK into cacheDir/updates, reporting [onProgress] in 0f..1f
+     * (or -1f while the total size is unknown). Returns the local file.
+     */
+    suspend fun download(
+        ctx: Context,
+        r: Release,
+        onProgress: (Float) -> Unit = {},
+    ): File = withContext(Dispatchers.IO) {
         val dir = File(ctx.cacheDir, "updates").apply { mkdirs() }
         val name = r.apkUrl.substringAfterLast('/').ifBlank { "update.apk" }
         val out = File(dir, name)
@@ -105,8 +140,19 @@ object UpdateChecker {
             setRequestProperty("User-Agent", "GameHubPlusPatcher")
         }
         try {
+            val total = conn.contentLengthLong
             conn.inputStream.use { input ->
-                out.outputStream().use { input.copyTo(it) }
+                out.outputStream().use { output ->
+                    val buf = ByteArray(64 * 1024)
+                    var done = 0L
+                    while (true) {
+                        val read = input.read(buf)
+                        if (read == -1) break
+                        output.write(buf, 0, read)
+                        done += read
+                        onProgress(if (total > 0) (done.toFloat() / total).coerceIn(0f, 1f) else -1f)
+                    }
+                }
             }
         } finally {
             conn.disconnect()
