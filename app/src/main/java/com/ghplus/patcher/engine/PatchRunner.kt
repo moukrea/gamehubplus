@@ -18,9 +18,11 @@ import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction21s
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction35c
 import com.android.tools.smali.dexlib2.iface.ClassDef
 import com.android.tools.smali.dexlib2.iface.instruction.FiveRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.TwoRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.reference.FieldReference
+import com.android.tools.smali.dexlib2.iface.reference.MethodReference
 import com.android.tools.smali.dexlib2.iface.reference.TypeReference
 import com.android.tools.smali.dexlib2.immutable.ImmutableClassDef
 import com.android.tools.smali.dexlib2.immutable.ImmutableDexFile
@@ -245,11 +247,11 @@ class PatchRunner(
         //    patcher(apkFile, temporaryFilesPath, frameworkFileDirectory, aaptBinaryPath).
         val output = File(cache, "GameHubPlus_patched.apk")
         val unsigned = File(cache, "GameHubPlus_unsigned.apk")
-        // Apply ALL patches (no per-patch toggles, per user): the patcher's
-        // compatibility check self-skips the 6.0.4-only ones (GPU Spoof, Legacy
-        // renderer, Mute UI sounds, Disable Firebase Crashlytics). The curated
-        // `selected` set above is now only used to apply the rebrand options.
-        val selectedSet = allPatches
+        // Apply ALL patches (no per-patch toggles, per user) EXCEPT "Change app
+        // icon": the user wants GameHub's OFFICIAL icons kept, not BannerHub's
+        // (that patch overwrites the launcher/splash/auth/wine drawables). The
+        // patcher's compatibility check self-skips the 6.0.4-only patches.
+        val selectedSet = allPatches.filterNot { it.name == "Change app icon" }.toSet()
         val failed = mutableListOf<String>()
 
         // Mute UI sounds on the SOURCE (toggleable) BEFORE patching, so the
@@ -308,6 +310,7 @@ class PatchRunner(
         renameNavProfile(unsigned)
         stripAccountSection(unsigned)
         hideNavTabs(unsigned)
+        forceSkipComposables(unsigned)
 
         // 8. Sign via ReVanced's ApkUtils.signApk — the canonical path that
         //    zip-aligns, keeps resources.arsc STORED, and writes v2/v3 sigs, i.e.
@@ -573,5 +576,90 @@ class PatchRunner(
             return
         }
         log("hide-tabs: Ldi9; not found in any dex")
+    }
+
+    /**
+     * Renders nothing for specific Compose composables by forcing their
+     * startRestartGroup skip. A composable body is
+     * `if (composer.Y(...)) { render } else { composer.b0() }`; inserting
+     * `const/4 vReg, 0` before the IF_EQZ that tests Y's result makes it always
+     * take the else branch (skipToGroupEnd) -> empty group -> nothing drawn.
+     *
+     * Removes the leftover profile banner (gn8.f portrait header + bn8.i landscape
+     * avatar card), the gear sub-menu "Login/Register" row (q2a.r), and the
+     * "Join community" promo banner (mdj.q + mdj.p, two layouts). Each target was
+     * located dex-level via its label field reader, then proven on a real device
+     * through the desktop DexEdit port. Skips ONLY the avatar/banner pieces — the
+     * Settings/Downloads buttons (ek8.k) stay (landscape's only settings entry).
+     */
+    private fun forceSkipComposables(apk: File) {
+        // (classType, methodName) composables to render nothing.
+        val targets = listOf(
+            "Lgn8;" to "f", // portrait profile banner
+            "Lq2a;" to "r", // gear sub-menu "Login/Register" row
+            "Lbn8;" to "i", // landscape profile avatar card
+            "Lmdj;" to "q", // "Join community" banner (layout 1)
+            "Lmdj;" to "p", // "Join community" banner (layout 2)
+        )
+        val byClass: Map<String, List<String>> = targets.groupBy({ it.first }, { it.second })
+        val dexNames = ZFile.openReadOnly(apk).use { zf ->
+            zf.entries().map { it.centralDirectoryHeader.name }
+                .filter { it.matches(Regex("classes\\d*\\.dex")) }
+        }
+        for (dexName in dexNames) {
+            val dexBytes = ZFile.openReadOnly(apk).use { it.get(dexName)!!.read() }
+            val tmpIn = File.createTempFile("dexin", ".dex", ctx.cacheDir).apply { writeBytes(dexBytes) }
+            val dex = DexFileFactory.loadDexFile(tmpIn, Opcodes.getDefault())
+            if (dex.classes.none { it.type in byClass.keys }) {
+                tmpIn.delete()
+                continue
+            }
+            var changed = false
+            val newClasses: List<ClassDef> = dex.classes.map { cd ->
+                val wanted = byClass[cd.type] ?: return@map cd
+                val newDirect = cd.directMethods.map dm@{ m ->
+                    if (m.name !in wanted) return@dm m
+                    val impl = m.implementation ?: return@dm m
+                    val insns = impl.instructions.toList()
+                    val yIdx = insns.indexOfFirst { ins ->
+                        ins.opcode == Opcode.INVOKE_VIRTUAL && ins is ReferenceInstruction &&
+                            (ins.reference as? MethodReference)
+                                ?.let { it.definingClass == "Lfo8;" && it.name == "Y" } == true
+                    }
+                    if (yIdx < 0) {
+                        log("forceSkip: no Lfo8;->Y in ${cd.type}->${m.name}")
+                        return@dm m
+                    }
+                    val ifIdx = (yIdx + 1 until insns.size)
+                        .firstOrNull { insns[it].opcode == Opcode.IF_EQZ } ?: return@dm m
+                    val reg = (insns[ifIdx] as OneRegisterInstruction).registerA
+                    val mut = MutableMethodImplementation(impl)
+                    val zero: BuilderInstruction = if (reg <= 15) {
+                        BuilderInstruction11n(Opcode.CONST_4, reg, 0)
+                    } else {
+                        BuilderInstruction21s(Opcode.CONST_16, reg, 0)
+                    }
+                    mut.addInstruction(ifIdx, zero)
+                    changed = true
+                    log("forceSkip ${cd.type}->${m.name}")
+                    ImmutableMethod(
+                        m.definingClass, m.name, m.parameters, m.returnType,
+                        m.accessFlags, m.annotations, m.hiddenApiRestrictions, mut,
+                    )
+                }
+                ImmutableClassDef(
+                    cd.type, cd.accessFlags, cd.superclass, cd.interfaces, cd.sourceFile,
+                    cd.annotations, cd.staticFields, cd.instanceFields, newDirect, cd.virtualMethods,
+                )
+            }
+            tmpIn.delete()
+            if (!changed) continue
+            val tmpOut = File.createTempFile("dexout", ".dex", ctx.cacheDir).apply { delete() }
+            DexFileFactory.writeDexFile(tmpOut.absolutePath, ImmutableDexFile(dex.opcodes, newClasses))
+            val outBytes = tmpOut.readBytes()
+            tmpOut.delete()
+            ZFile.openReadWrite(apk).use { it.add(dexName, outBytes.inputStream(), true) }
+        }
+        log("Removed profile banner + gear Login/Register + Join banner")
     }
 }
