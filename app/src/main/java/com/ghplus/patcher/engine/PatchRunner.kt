@@ -624,7 +624,8 @@ class PatchRunner(
             "Lmdj;" to "q", // "Join community" banner (layout 1)
             "Lmdj;" to "p", // "Join community" banner (layout 2)
             "Lyrh;" to "invoke", // Settings account/login section — PORTRAIT (incl Login/Register)
-            "Lji5;" to "b", // Settings account/login section — LANDSCAPE twin
+            // NOTE: ji5.b is NOT the landscape twin — it is the generic settings-group
+            // renderer (Mode/Language/.../Storage); skipping it blanks the whole group.
         )
         val byClass: Map<String, List<String>> = targets.groupBy({ it.first }, { it.second })
         val dexNames = ZFile.openReadOnly(apk).use { zf ->
