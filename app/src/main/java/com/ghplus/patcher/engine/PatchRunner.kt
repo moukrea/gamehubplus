@@ -332,6 +332,7 @@ class PatchRunner(
         forceSkipComposables(unsigned)
         writeAgreementPrefs(unsigned)
         forceNotifDenied(unsigned)
+        unrequestNotifPermission(unsigned)
 
         // 8. Sign via ReVanced's ApkUtils.signApk — the canonical path that
         //    zip-aligns, keeps resources.arsc STORED, and writes v2/v3 sigs, i.e.
@@ -812,5 +813,40 @@ class PatchRunner(
             return
         }
         log("forceNotifDenied: rj8 not found")
+    }
+
+    /**
+     * Un-declares POST_NOTIFICATIONS in the (binary AXML) manifest by renaming the
+     * permission string in place (same byte length, UTF-16LE) to a bogus name.
+     * An undeclared runtime permission is auto-denied by Android with NO system
+     * dialog, so the notification prompt never shows and notifications can't be
+     * posted — path-independent (covers requests from any GameHub or bannerhub /
+     * push-SDK code path, unlike the rj8.M decision hook alone).
+     */
+    private fun unrequestNotifPermission(apk: File) {
+        val old = "android.permission.POST_NOTIFICATIONS".toByteArray(Charsets.UTF_16LE)
+        val bogus = "android.permission.POST_NOTIFICATIONX".toByteArray(Charsets.UTF_16LE)
+        ZFile.openReadWrite(apk).use { zf ->
+            val entry = zf.get("AndroidManifest.xml") ?: run { log("notif: manifest not found"); return }
+            val data = entry.read()
+            var i = indexOf(data, old, 0)
+            if (i < 0) { log("notif: POST_NOTIFICATIONS not declared (nothing to do)"); return }
+            var n = 0
+            while (i >= 0) {
+                System.arraycopy(bogus, 0, data, i, bogus.size) // same length -> in-place
+                n++
+                i = indexOf(data, old, i + old.size)
+            }
+            zf.add("AndroidManifest.xml", data.inputStream(), true)
+            log("notif: un-declared POST_NOTIFICATIONS in manifest ($n)")
+        }
+    }
+
+    private fun indexOf(haystack: ByteArray, needle: ByteArray, from: Int): Int {
+        outer@ for (i in from..haystack.size - needle.size) {
+            for (j in needle.indices) if (haystack[i + j] != needle[j]) continue@outer
+            return i
+        }
+        return -1
     }
 }
