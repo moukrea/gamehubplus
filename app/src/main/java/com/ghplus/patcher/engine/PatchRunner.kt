@@ -19,6 +19,7 @@ import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction21c
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction21s
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction35c
 import com.android.tools.smali.dexlib2.iface.ClassDef
+import com.android.tools.smali.dexlib2.iface.Method
 import com.android.tools.smali.dexlib2.iface.instruction.FiveRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
@@ -622,6 +623,8 @@ class PatchRunner(
             "Lbn8;" to "i", // landscape profile avatar card
             "Lmdj;" to "q", // "Join community" banner (layout 1)
             "Lmdj;" to "p", // "Join community" banner (layout 2)
+            "Lyrh;" to "invoke", // Settings account/login section — PORTRAIT (incl Login/Register)
+            "Lji5;" to "b", // Settings account/login section — LANDSCAPE twin
         )
         val byClass: Map<String, List<String>> = targets.groupBy({ it.first }, { it.second })
         val dexNames = ZFile.openReadOnly(apk).use { zf ->
@@ -639,9 +642,12 @@ class PatchRunner(
             var changed = false
             val newClasses: List<ClassDef> = dex.classes.map { cd ->
                 val wanted = byClass[cd.type] ?: return@map cd
-                val newDirect = cd.directMethods.map dm@{ m ->
-                    if (m.name !in wanted) return@dm m
-                    val impl = m.implementation ?: return@dm m
+                // Scan BOTH direct and virtual methods: static composables (gn8.f) are
+                // direct, but lambda/interface invokes (yrh.invoke = account section)
+                // are virtual — the original direct-only scan silently missed them.
+                val skip = fun(m: Method): Method {
+                    if (m.name !in wanted) return m
+                    val impl = m.implementation ?: return m
                     val insns = impl.instructions.toList()
                     val yIdx = insns.indexOfFirst { ins ->
                         ins.opcode == Opcode.INVOKE_VIRTUAL && ins is ReferenceInstruction &&
@@ -650,10 +656,10 @@ class PatchRunner(
                     }
                     if (yIdx < 0) {
                         log("forceSkip: no Lfo8;->Y in ${cd.type}->${m.name}")
-                        return@dm m
+                        return m
                     }
                     val ifIdx = (yIdx + 1 until insns.size)
-                        .firstOrNull { insns[it].opcode == Opcode.IF_EQZ } ?: return@dm m
+                        .firstOrNull { insns[it].opcode == Opcode.IF_EQZ } ?: return m
                     val reg = (insns[ifIdx] as OneRegisterInstruction).registerA
                     val mut = MutableMethodImplementation(impl)
                     val zero: BuilderInstruction = if (reg <= 15) {
@@ -664,14 +670,15 @@ class PatchRunner(
                     mut.addInstruction(ifIdx, zero)
                     changed = true
                     log("forceSkip ${cd.type}->${m.name}")
-                    ImmutableMethod(
+                    return ImmutableMethod(
                         m.definingClass, m.name, m.parameters, m.returnType,
                         m.accessFlags, m.annotations, m.hiddenApiRestrictions, mut,
                     )
                 }
                 ImmutableClassDef(
                     cd.type, cd.accessFlags, cd.superclass, cd.interfaces, cd.sourceFile,
-                    cd.annotations, cd.staticFields, cd.instanceFields, newDirect, cd.virtualMethods,
+                    cd.annotations, cd.staticFields, cd.instanceFields,
+                    cd.directMethods.map(skip), cd.virtualMethods.map(skip),
                 )
             }
             tmpIn.delete()
